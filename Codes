@@ -1,0 +1,164 @@
+# bundelkhand_4panel_valid.R
+# Purpose: Create a 4-panel map (A–D) using India district shapefile and sample data
+# Includes: repair step for invalid polygons
+
+# -------------------- Packages require for it  --------------------
+required <- c("sf", "ggplot2", "dplyr", "patchwork", "scales", "ggspatial", "lwgeom")
+new <- required[!(required %in% installed.packages()[,"Package"])]
+if(length(new)) install.packages(new, dependencies = TRUE)
+
+library(sf)
+library(ggplot2)
+library(dplyr)
+library(patchwork)
+library(scales)
+library(ggspatial)
+library(lwgeom)
+
+# -------------------- User inputs (Shape_file and Output name ) --------------------
+india_shp_path <- "D:/SHAPE/Administrative Boundary Database For entire country Upto Taluk level with HQ/91/DISTRICT_BOUNDARY.shp"   # <-- REPLACE with your shapefile path
+output_png <- "bundelkhand_4panel.png"
+output_pdf <- "bundelkhand_4panel.pdf"
+
+# -------------------- Station data (Samples from District)  --------------------
+stations <- data.frame(
+  name = c("Hamirpur","Banda","Jhansi","Lalitpur"),
+  lon  = c(80.1241899, 80.2848440, 78.4502050, 78.4785190),
+  lat  = c(25.5541481, 25.4464850, 25.5410780, 24.9785660),
+  temp_C = c(26.51, 26.65, 25.93, 25.39),
+  precip_mm = c(802.48, 773.41, 1070.03, 1137.65),
+  rh_pct = c(53.78, 53.76, 56.42, 56.65),
+  stringsAsFactors = FALSE
+)
+
+# -------------------- Reading shapefile --------------------
+india_districts <- st_read(india_shp_path, quiet = TRUE)
+
+# Ensuring  CRS is set
+if (is.na(st_crs(india_districts))) {
+  warning("Shapefile CRS missing. Assuming EPSG:4326 (WGS84). If incorrect, set correct EPSG code.")
+  st_crs(india_districts) <- 4326
+}
+# Transforming  to WGS84
+india_districts <- st_transform(india_districts, 4326)
+
+# -------------------- For Repairing  invalid polygons --------------------
+invalid_idx <- which(!st_is_valid(india_districts))
+message("Invalid polygons before fix: ", length(invalid_idx))
+
+india_districts <- sf::st_make_valid(india_districts)
+packageVersion("sf")
+# Try sf::st_make_valid if available, else fallback
+if("st_make_valid" %in% getNamespaceExports("sf")) {
+  india_districts <- sf::st_make_valid(india_districts)
+} else {
+  warning("sf::st_make_valid not available, using st_buffer(0) instead")
+  india_districts <- st_buffer(india_districts, 0)
+}
+
+if(length(invalid_idx) > 0){
+  india_districts <- lwgeom::st_make_valid(india_districts)
+  invalid_idx2 <- which(!st_is_valid(india_districts))
+  message("Invalid polygons after st_make_valid: ", length(invalid_idx2))
+  
+  if(length(invalid_idx2) > 0){
+    message("Applying st_buffer(0) fallback...")
+    india_districts$geometry[invalid_idx2] <- st_buffer(india_districts$geometry[invalid_idx2], 0)
+    invalid_idx3 <- which(!st_is_valid(india_districts))
+    message("Invalid polygons remaining: ", length(invalid_idx3))
+  }
+}
+
+# -------------------- Prepare stations --------------------
+stations_sf <- st_as_sf(stations, coords = c("lon","lat"), crs = 4326, remove = FALSE)
+
+# -------------------- Spatial join (stations → districts) --------------------
+india_districts$district_id <- seq_len(nrow(india_districts))
+ints <- st_intersects(stations_sf, india_districts)
+poly_idx <- sapply(ints, function(x) if(length(x)) x[1] else NA_integer_)
+if(any(is.na(poly_idx))) {
+  na_idx <- which(is.na(poly_idx))
+  message("Fallback to nearest polygon for station(s): ", paste(na_idx, collapse=", "))
+  poly_idx[na_idx] <- st_nearest_feature(stations_sf[na_idx,], india_districts)
+}
+stations_vals <- stations %>% mutate(district_id = india_districts$district_id[poly_idx])
+
+# -------------------- Aggregate values --------------------
+district_params <- stations_vals %>%
+  group_by(district_id) %>%
+  summarise(
+    temp_C = mean(temp_C, na.rm=TRUE),
+    precip_mm = mean(precip_mm, na.rm=TRUE),
+    rh_pct = mean(rh_pct, na.rm=TRUE),
+    station_names = paste(name, collapse=";"),
+    .groups="drop"
+  )
+
+# -------------------- Joining  back to polygons --------------------
+india_with_params <- india_districts %>% left_join(district_params, by="district_id")
+sample_polys <- india_with_params %>% filter(!is.na(temp_C))
+
+if(nrow(sample_polys)==0) stop("No sample districts matched. Check CRS/coords.")
+
+# -------------------- Bounding the  boxes --------------------
+sample_bbox <- st_bbox(sample_polys) # already in degrees
+buffer_deg <- 0.8
+zoom_xlim <- c(sample_bbox["xmin"] - buffer_deg, sample_bbox["xmax"] + buffer_deg)
+zoom_ylim <- c(sample_bbox["ymin"] - buffer_deg, sample_bbox["ymax"] + buffer_deg)
+
+india_bbox <- st_bbox(india_with_params)
+india_xlim <- c(india_bbox["xmin"], india_bbox["xmax"])
+india_ylim <- c(india_bbox["ymin"], india_bbox["ymax"])
+
+# -------------------- Ploting  theme --------------------
+base_theme <- theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face="bold", size=14),
+        legend.title = element_text(face="bold"),
+        plot.margin = margin(10,10,10,10))
+
+# -------------------- Plotting Maps --------------------
+mapA <- ggplot() +
+  geom_sf(data=india_with_params, fill="grey95", color="grey80", size=0.2) +
+  geom_sf(data=sample_polys, fill="#FFB84D", color="black", size=0.3) +
+  labs(title="(A) Location of sample districts in India") +
+  coord_sf(xlim=india_xlim, ylim=india_ylim, expand=FALSE) +
+  base_theme +
+  annotation_scale(location="bl", width_hint=0.25) +
+  annotation_north_arrow(location="br", which_north="true",
+                         style=ggspatial::north_arrow_fancy_orienteering)
+
+mapB <- ggplot() +
+  geom_sf(data=india_with_params, fill="grey98", color="grey85", size=0.15) +
+  geom_sf(data=sample_polys, aes(fill=temp_C), color="black", size=0.3) +
+  scale_fill_viridis_c(option="plasma", name="Temp (°C)") +
+  labs(title="(B) District-wise Avg Temperature") +
+  coord_sf(xlim=zoom_xlim, ylim=zoom_ylim, expand=FALSE) +
+  base_theme + theme(legend.position="right")
+
+mapC <- ggplot() +
+  geom_sf(data=india_with_params, fill="grey98", color="grey85", size=0.15) +
+  geom_sf(data=sample_polys, aes(fill=precip_mm), color="black", size=0.3) +
+  scale_fill_viridis_c(option="plasma", name="Precip (mm/yr)") +
+  labs(title="(C) District-wise Avg Precipitation") +
+  coord_sf(xlim=zoom_xlim, ylim=zoom_ylim, expand=FALSE) +
+  base_theme + theme(legend.position="right")
+
+mapD <- ggplot() +
+  geom_sf(data=india_with_params, fill="grey98", color="grey85", size=0.15) +
+  geom_sf(data=sample_polys, aes(fill=rh_pct), color="black", size=0.3) +
+  scale_fill_viridis_c(option="plasma", name="RH (%)") +
+  labs(title="(D) District-wise Relative Humidity") +
+  coord_sf(xlim=zoom_xlim, ylim=zoom_ylim, expand=FALSE) +
+  base_theme + theme(legend.position="right")
+
+# -------------------- Layout (4 panels) 1. India and 3 District (Samples) --------------------
+final_layout <- mapA / (mapB | mapC | mapD) +
+  plot_layout(heights=c(1,1.4)) +
+  plot_annotation(title="District-level Climate Parameters in Bundelkhand",
+                  theme=theme(plot.title=element_text(size=18, face="bold", hjust=0.5)))
+
+# -------------------- Save --------------------
+ggsave(output_png, final_layout, width=14, height=11, dpi=300)
+ggsave(output_pdf, final_layout, width=14, height=11)
+
+print(final_layout)
